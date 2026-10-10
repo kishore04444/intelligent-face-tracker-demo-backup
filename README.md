@@ -29,48 +29,113 @@ The objective is to maintain a reliable unique visitor count instead of simply c
 
 ## 3. System Architecture
 
-    VIDEO / CAMERA / RTSP
-             |
-             v
-      YOLO Face Detection
-             |
-             v
-          ByteTrack
-             |
-             v
-       Stable Track IDs
-             |
-             v
-      InsightFace / ArcFace
-             |
-             v
-        Face Embedding
-             |
-       +-----+-----+
-       |           |
-       v           v
-   Known Face   New Face
-       |           |
-       v           v
-  Recognize ID  Confirmation
-                   |
-                   v
-            Auto Registration
-                   |
-          +--------+--------+
-          |        |        |
-          v        v        v
-       ENTRY   TRACKING    EXIT
-          |        |        |
-          +--------+--------+
-                   |
-          +--------+--------+
-          |        |        |
-          v        v        v
-       SQLite  events.log  Face Images
-                   |
-                   v
-          UNIQUE VISITOR COUNT
+The diagram shows the two connected paths: video ingestion and recognition,
+and dashboard control and display. Optional detections are marked explicitly.
+
+```mermaid
+flowchart LR
+    subgraph Sources["Video sources"]
+        BrowserCamera["Browser camera"]
+        DeviceSource["Local camera, video file, or network stream"]
+        Upload["Video upload"]
+    end
+
+    subgraph Dashboard["Dashboard service (Flask)"]
+        UI["Dashboard UI"]
+        ControlAPI["Source, camera-frame, and upload APIs"]
+        ReadAPI["Status, statistics, visitor, event, and sighting APIs"]
+        MJPEG["Annotated MJPEG stream"]
+        UI --> ControlAPI
+        UI --> ReadAPI
+        ReadAPI --> UI
+        MJPEG --> UI
+    end
+
+    BrowserCamera -->|JPEG frames| ControlAPI
+    Upload --> ControlAPI
+    ControlAPI -->|save uploaded video| UploadStore["videos/uploads"]
+    ControlAPI -->|queued source changes / browser camera frames| Loop
+
+    DeviceSource --> Capture["OpenCV video capture"]
+    UploadStore --> Capture
+
+    subgraph Tracker["Tracking process (src/main.py)"]
+        Loop["Frame processing loop"]
+        FaceDetect["YOLOv8 face detection + ByteTrack"]
+        Validation{"YuNet validation enabled?"}
+        YuNet["YuNet cross-validation"]
+        PersonDetect["Optional OpenCV HOG person detection"]
+        Recognize["Recognition worker pool"]
+        Embed["InsightFace / ArcFace face embedding"]
+        Manager["VisitorManager: match or confirm new identity"]
+        Lifecycle["Track lifecycle and entry / exit handling"]
+        Count["Distinct visitor IDs (unique count)"]
+
+        Loop --> FaceDetect
+        FaceDetect --> Validation
+        Validation -->|yes| YuNet
+        YuNet -->|confirmed candidates| Recognize
+        Validation -->|no| Recognize
+        Loop -. "when enabled" .-> PersonDetect
+        Recognize --> Embed
+        Embed --> Manager
+        Manager --> Lifecycle
+        Lifecycle --> Count
+    end
+
+    Capture --> Loop
+    ControlAPI -->|browser camera frames| Loop
+
+    subgraph Storage["Persistent files"]
+        DB[("SQLite: visitors, embedding templates, events, sightings")]
+        EventLog["logs/events.log"]
+        Images["Face evidence under logs/"]
+    end
+
+    Manager <--> DB
+    Lifecycle -->|ENTRY / EXIT records| DB
+    Loop -->|unrecognized sightings| DB
+    Lifecycle -->|application events| EventLog
+    Lifecycle -. "if image saving is enabled" .-> Images
+    Loop -. "unrecognized-sighting images, when enabled" .-> Images
+    Loop -->|annotated frames| MJPEG
+    Count --> MJPEG
+    DB --> ReadAPI
+
+    PersonDetect -. "no-face detections; not identity matches" .-> Lifecycle
+```
+
+### Architecture walkthrough
+
+1. **Input and source control:** `src/main.py` reads the configured source and
+   uses OpenCV for attached cameras, video files, and supported network streams.
+   The Flask dashboard can queue a source change or save an uploaded video under
+   `videos/uploads`. For a browser camera, the dashboard sends JPEG frames to
+   Flask, which passes them to the processing loop.
+2. **Detection and tracking:** The processing loop runs YOLOv8 face detection
+   with ByteTrack to associate detections with track IDs. YuNet face
+   cross-validation is optional. The optional OpenCV HOG detector reports
+   person boxes without a visible face; it does not recognize those people or
+   associate them with a visitor identity.
+3. **Recognition and registration:** Stable face tracks are submitted to a
+   small worker pool. InsightFace produces an ArcFace embedding, and
+   `VisitorManager` compares it with the stored visitor embedding templates.
+   A match reuses the existing visitor ID. An unmatched face remains pending
+   until consistent observations confirm it, then a new visitor and embedding
+   are stored in SQLite.
+4. **Events and evidence:** Recognized tracks produce one `ENTRY` event per
+   active track and an `EXIT` event when the track expires. Visitor records,
+   embedding templates, and entry/exit events are persisted in
+   `database/visitors.db`. Operational messages, including tracking activity,
+   are written to `logs/events.log`; tracking messages are not separate
+   database event records. Face images are saved under `logs/` when image
+   saving is enabled. Unrecognized face and no-face person sightings are
+   recorded separately from visitor identities.
+5. **Dashboard output:** The Flask service serves the browser UI, source
+   controls, and JSON APIs that read status and persisted data. The processing
+   loop sends annotated frames to the dashboard's MJPEG stream. The dashboard
+   runs alongside the tracker in a server thread; it is not a separate
+   recognition or tracking process.
 
 ## 4. Technology Stack
 
@@ -298,7 +363,9 @@ Use `validate_with_yunet: true` to enable the second detector when precision is 
 
 controls the minimum similarity required to recognize a stored visitor. The default was raised to reduce false matches; identities with poor lighting, side angles, or very small faces may need another clear observation before they match.
 
-Unregistered faces are enrolled only after three same-track observations agree (default pending similarity 0.60), which reduces duplicate visitor records without relying on a single blurry frame.
+Unregistered faces are enrolled only after two consistent same-track embeddings
+agree (default pending similarity 0.60), which reduces duplicate visitor
+records without relying on a single blurry frame.
 
 ### Tracking
 
