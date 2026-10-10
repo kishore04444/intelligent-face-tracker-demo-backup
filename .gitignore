@@ -11,9 +11,11 @@ database/*.sqlite3
 
 # Runtime logs
 logs/events.log
+logs/events.log.*
 logs/entries/
 logs/entrys/
 logs/exits/
+logs/unrecognized/
 
 # Generated output
 output/

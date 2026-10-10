@@ -1,26 +1,33 @@
+import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 # ============================================================
 # PROJECT ROOT
 # ============================================================
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 sys.path.insert(
     0,
-    str(
-        Path(__file__).resolve().parent.parent
-    )
+    str(PROJECT_ROOT)
 )
+
+os.chdir(PROJECT_ROOT)
 
 
 # ============================================================
 # IMPORTS
 # ============================================================
 
+import time
+
 import cv2
 import json
 import math
+import uuid
 
 from collections import defaultdict
 
@@ -34,20 +41,37 @@ from face_recognizer import (
     FaceRecognizer
 )
 
+from configuration import (
+    validate_config,
+)
+
 from visitor_manager import (
     VisitorManager
 )
+
+from person_detection import PersonDetector
+from video_input import open_capture
 
 from logger import (
     log_event
 )
 
 from image_logger import (
-    save_face_image
+    delete_event_images,
+    save_face_image,
+    save_unrecognized_image,
 )
 
 from dashboard_server import (
-    DashboardServer
+    DashboardServer,
+    clear_browser_frame,
+    clear_frame,
+    describe_source,
+    get_source_status,
+    set_database_reset_status,
+    set_source_status,
+    take_database_reset_request,
+    take_requested_source,
 )
 
 
@@ -56,12 +80,56 @@ from dashboard_server import (
 # ============================================================
 
 with open(
-    "config.json",
+    PROJECT_ROOT / "config.json",
     "r",
     encoding="utf-8"
 ) as file:
 
-    config = json.load(file)
+    config = validate_config(json.load(file))
+
+
+LIVE_SOURCE_SCHEMES = {
+    "http",
+    "https",
+    "rtmp",
+    "rtmps",
+    "rtsp",
+    "rtsps",
+}
+
+
+def normalize_capture_source(value):
+    if isinstance(value, int):
+        return value
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Input source must be a camera index, stream URL, or video path.")
+
+    source_text = value.strip()
+    if source_text.isdecimal():
+        return int(source_text)
+
+    parsed = urlsplit(source_text)
+    if parsed.scheme.lower() in LIVE_SOURCE_SCHEMES and parsed.hostname:
+        return source_text
+
+    source_path = Path(source_text)
+    if not source_path.is_absolute():
+        source_path = PROJECT_ROOT / source_path
+    return str(source_path.resolve())
+
+
+def is_live_capture_source(value):
+    if value == "browser":
+        return True
+    if isinstance(value, int):
+        return True
+
+    try:
+        parsed = urlsplit(str(value))
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in LIVE_SOURCE_SCHEMES
 
 
 # ============================================================
@@ -69,11 +137,11 @@ with open(
 # ============================================================
 
 YOLO_MODEL_PATH = (
-    "models/yolov8n-face.pt"
+    str(PROJECT_ROOT / "models" / "yolov8n-face.pt")
 )
 
 YUNET_MODEL_PATH = (
-    "models/face_detection_yunet_2023mar.onnx"
+    str(PROJECT_ROOT / "models" / "face_detection_yunet_2023mar.onnx")
 )
 
 
@@ -81,28 +149,29 @@ YUNET_MODEL_PATH = (
 # DETECTION SETTINGS
 # ============================================================
 
-YOLO_CONFIDENCE = max(
-    0.65,
-    config[
-        "detection"
-    ][
-        "confidence"
-    ]
+DETECTION_CONFIG = config["detection"]
+YOLO_CONFIDENCE = float(
+    DETECTION_CONFIG.get("confidence", 0.25)
 )
+if not 0.0 < YOLO_CONFIDENCE < 1.0:
+    raise ValueError("detection.confidence must be between 0 and 1.")
 
-
-CONFIG_SKIP_FRAMES = (
-    config[
-        "detection"
-    ][
-        "skip_frames"
-    ]
+SKIP_FRAMES = max(0, int(DETECTION_CONFIG.get("skip_frames", 1)))
+YOLO_IMAGE_SIZE = max(320, int(DETECTION_CONFIG.get("image_size", 800)))
+MIN_FACE_SIZE = max(1, int(DETECTION_CONFIG.get("min_face_size", 20)))
+VALIDATE_WITH_YUNET = bool(
+    DETECTION_CONFIG.get("validate_with_yunet", False)
 )
-
-
-SKIP_FRAMES = min(
-    CONFIG_SKIP_FRAMES,
-    2
+PERSON_DETECTION_CONFIG = config.get("person_detection", {})
+PERSON_DETECTION_ENABLED = bool(
+    PERSON_DETECTION_CONFIG.get("enabled", True)
+)
+PERSON_DETECTION_MAX_DIMENSION = max(
+    320,
+    int(PERSON_DETECTION_CONFIG.get("max_dimension", 640)),
+)
+PERSON_DETECTION_SCORE_THRESHOLD = float(
+    PERSON_DETECTION_CONFIG.get("score_threshold", 1.1)
 )
 
 
@@ -158,11 +227,6 @@ SAVE_IMAGES = (
 # FACE FILTER SETTINGS
 # ============================================================
 
-MIN_FACE_WIDTH = 45
-
-MIN_FACE_HEIGHT = 45
-
-
 # ============================================================
 # IMPORTANT RECOGNITION SETTINGS
 #
@@ -176,16 +240,9 @@ STABLE_TRACK_COUNT = 1
 
 
 # ============================================================
-# IMPORTANT:
-#
-# VisitorManager requires multiple consistent observations
-# before registering a completely new face.
-#
-# Therefore this MUST be greater than 2.
+# Recognition is retried with a per-track backoff if an embedding
+# cannot be extracted; a low-quality crop must not permanently block a visitor.
 # ============================================================
-
-MAX_RECOGNITION_ATTEMPTS = 4
-
 
 # ============================================================
 # DISPLAY SETTINGS
@@ -198,7 +255,9 @@ MAX_DISPLAY_MISSING_CYCLES = 5
 # YUNET SETTINGS
 # ============================================================
 
-YUNET_SCORE_THRESHOLD = 0.70
+YUNET_SCORE_THRESHOLD = float(
+    DETECTION_CONFIG.get("yunet_confidence", 0.7)
+)
 
 FACE_VALIDATION_IOU = 0.20
 
@@ -307,6 +366,25 @@ def calculate_iou(
         /
         union
     )
+
+
+def detect_yunet_boxes(frame, detector):
+    detector.setInputSize((frame.shape[1], frame.shape[0]))
+    _, faces = detector.detect(frame)
+    if faces is None:
+        return []
+
+    boxes = []
+    frame_height, frame_width = frame.shape[:2]
+    for face in faces:
+        x, y, width, height = map(int, face[:4])
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(frame_width, x + width)
+        y2 = min(frame_height, y + height)
+        if x2 > x1 and y2 > y1:
+            boxes.append((x1, y1, x2, y2))
+    return boxes
 
 
 # ============================================================
@@ -444,26 +522,33 @@ yolo = YOLO(
     YOLO_MODEL_PATH
 )
 
+if PERSON_DETECTION_ENABLED:
+    person_detector = PersonDetector(
+        max_dimension=PERSON_DETECTION_MAX_DIMENSION,
+        score_threshold=PERSON_DETECTION_SCORE_THRESHOLD,
+        min_hits=int(PERSON_DETECTION_CONFIG.get("min_hits", 2)),
+        max_missing=int(PERSON_DETECTION_CONFIG.get("max_missing", 1)),
+    )
+else:
+    person_detector = None
+
 
 # ============================================================
 # LOAD YUNET
 # ============================================================
 
-print(
-    "Loading YuNet face validator..."
-)
-
-
-yunet = (
-    cv2.FaceDetectorYN.create(
+if VALIDATE_WITH_YUNET:
+    print("Loading YuNet face validator...")
+    yunet = cv2.FaceDetectorYN.create(
         YUNET_MODEL_PATH,
         "",
         (320, 320),
         YUNET_SCORE_THRESHOLD,
         0.30,
-        5000
+        5000,
     )
-)
+else:
+    yunet = None
 
 
 # ============================================================
@@ -515,44 +600,42 @@ source = (
     ]
 )
 
-
-if (
-    isinstance(
-        source,
-        str
+try:
+    source = normalize_capture_source(source)
+    cap = (
+        open_capture(source)
+        if source != "browser"
+        else cv2.VideoCapture()
     )
-    and
-    source.isdigit()
-):
-
-    source = int(
-        source
+except (ValueError, cv2.error) as error:
+    cap = cv2.VideoCapture()
+    message = (
+        f"Could not initialize {describe_source(source)}."
+        if is_live_capture_source(source)
+        else f"Could not initialize video source: {error}"
     )
+    print(f"ERROR: {message}")
+    set_source_status("error", source, message)
+else:
+    if source == "browser":
+        set_source_status(
+            "waiting",
+            source,
+            "Click Start device camera in the dashboard to begin.",
+        )
+        print("Waiting for the dashboard device camera.")
+    elif cap.isOpened():
+        set_source_status("running", source, "Video source opened successfully.")
+        print("Video source opened successfully.")
+    else:
+        message = f"Could not open video source: {describe_source(source)}"
+        print(f"ERROR: {message}")
+        set_source_status("error", source, message)
 
-
-cap = cv2.VideoCapture(
-    source
-)
-
-
-if not cap.isOpened():
-
-    print(
-        "ERROR: "
-        "Could not open video source."
-    )
-
-    visitor_manager.close()
-
-    raise SystemExit(1)
-
+source_is_live = is_live_capture_source(source)
 
 print(
-    "Video source opened successfully."
-)
-
-print(
-    "Press Q to quit."
+    "Press Q to quit. Use the dashboard to upload a video or connect a stream."
 )
 
 
@@ -581,6 +664,10 @@ missing_frames = (
 
 recognition_attempts = (
     defaultdict(int)
+)
+
+recognition_retry_after = (
+    defaultdict(float)
 )
 
 
@@ -617,6 +704,127 @@ unique_visitors = set()
 # ============================================================
 
 entry_logged_tracks = set()
+read_failure_count = 0
+browser_frame_version = 0
+browser_last_frame_at = 0.0
+last_person_boxes = []
+sighting_track_keys = {}
+
+
+def record_unrecognized_sighting(kind, track_id, label, image_crop):
+    tracker_key = (kind, track_id)
+    if tracker_key in sighting_track_keys:
+        return
+
+    persistent_key = uuid.uuid4().hex
+    image_path = None
+    if image_crop is not None and image_crop.size:
+        try:
+            image_path = save_unrecognized_image(image_crop)
+        except OSError as error:
+            log_event(
+                f"UNRECOGNIZED_IMAGE_SAVE_ERROR | "
+                f"kind={kind} | track_id={track_id} | error={error}"
+            )
+
+    visitor_manager.db.add_unrecognized_sighting(
+        persistent_key,
+        kind,
+        label,
+        image_path,
+    )
+    sighting_track_keys[tracker_key] = persistent_key
+    log_event(
+        f"UNRECOGNIZED_SIGHTING | kind={kind} | "
+        f"track_id={track_id} | sighting_id={persistent_key}"
+    )
+
+
+def finish_active_tracks():
+    for track_id, future in list(recognition_jobs.items()):
+        try:
+            embedding = future.result(timeout=10)
+        except Exception as error:
+            log_event(
+                f"RECOGNITION_ERROR | "
+                f"track_id={track_id} | "
+                f"error={error}"
+            )
+            embedding = None
+
+        if embedding is None or track_id in expired_tracks:
+            continue
+
+        visitor_id, is_new = visitor_manager.identify(track_id, embedding)
+        if visitor_id is None:
+            continue
+
+        unique_visitors.add(visitor_id)
+        if track_id not in entry_logged_tracks:
+            image_path = None
+            face_crop = last_face_crops.get(track_id)
+            if SAVE_IMAGES and face_crop is not None:
+                image_path = save_face_image(face_crop, "ENTRY")
+
+            visitor_manager.db.add_event(visitor_id, "ENTRY", image_path)
+            log_event(
+                f"ENTRY | visitor_id={visitor_id} | track_id={track_id}"
+            )
+            entry_logged_tracks.add(track_id)
+
+        event_name = "VISITOR_REGISTERED" if is_new else "VISITOR_RECOGNIZED"
+        log_event(
+            f"{event_name} | visitor_id={visitor_id} | track_id={track_id}"
+        )
+
+    recognition_jobs.clear()
+
+    for track_id in list(active_tracks):
+        visitor_id = visitor_manager.remove_track(track_id)
+        if visitor_id is not None:
+            image_path = None
+            face_crop = last_face_crops.get(track_id)
+            if SAVE_IMAGES and face_crop is not None:
+                image_path = save_face_image(face_crop, "EXIT")
+
+            visitor_manager.db.add_event(visitor_id, "EXIT", image_path)
+            log_event(
+                f"EXIT | visitor_id={visitor_id} | track_id={track_id}"
+            )
+
+    active_tracks.clear()
+    visitor_manager.pending_tracks.clear()
+
+
+def reset_tracker_data():
+    global last_person_boxes
+    image_paths = visitor_manager.db.get_event_image_paths()
+    image_paths.extend(visitor_manager.db.get_unrecognized_image_paths())
+    delete_event_images(image_paths, PROJECT_ROOT)
+
+    visitor_manager.db.reset()
+    for future in recognition_jobs.values():
+        future.cancel()
+    recognition_jobs.clear()
+    last_boxes.clear()
+    last_face_crops.clear()
+    track_seen_count.clear()
+    missing_frames.clear()
+    recognition_attempts.clear()
+    recognition_retry_after.clear()
+    last_person_boxes = []
+    sighting_track_keys.clear()
+    if person_detector is not None:
+        person_detector.reset()
+    failed_tracks.clear()
+    active_tracks.clear()
+    expired_tracks.clear()
+    entry_logged_tracks.clear()
+    unique_visitors.clear()
+    visitor_manager.track_to_visitor.clear()
+    visitor_manager.pending_tracks.clear()
+    visitor_manager.clear_template_cache()
+    clear_frame()
 
 
 # ============================================================
@@ -654,24 +862,212 @@ try:
 
     while True:
 
+        if take_database_reset_request():
+            try:
+                reset_tracker_data()
+            except Exception as error:
+                log_event(f"DATABASE_RESET_ERROR | error={error}")
+                set_database_reset_status(
+                    "error",
+                    "Database reset failed. Check logs/events.log for details.",
+                )
+            else:
+                log_event(
+                    "DATABASE_RESET | visitors=0 | events=0 | "
+                    "saved_face_evidence=cleared"
+                )
+                set_database_reset_status(
+                    "complete",
+                    "Reset complete. Visitor IDs, event counts, and saved face evidence were cleared.",
+                )
+
+        requested_source = take_requested_source()
+        if requested_source is not None:
+            try:
+                next_source = normalize_capture_source(requested_source)
+                next_cap = (
+                    None
+                    if next_source == "browser"
+                    else open_capture(next_source)
+                )
+            except (ValueError, cv2.error) as error:
+                message = (
+                    f"Could not initialize {describe_source(requested_source)}."
+                    if is_live_capture_source(requested_source)
+                    else f"Could not initialize requested source: {error}"
+                )
+                print(f"ERROR: {message}")
+                set_source_status("error", source, message)
+            else:
+                if next_cap is not None and not next_cap.isOpened():
+                    next_cap.release()
+                    if (
+                        isinstance(next_source, str)
+                        and urlsplit(next_source).scheme.lower()
+                        in {"rtsp", "rtsps"}
+                    ):
+                        message = (
+                            f"Could not open RTSP stream "
+                            f"({describe_source(next_source)}). Tried TCP and "
+                            "UDP transport; check that the camera is reachable, "
+                            "the RTSP port/path is correct, and credentials are "
+                            "valid. The current source remains selected."
+                        )
+                    else:
+                        message = (
+                            f"Could not open {describe_source(next_source)}; "
+                            "the current source remains selected."
+                        )
+                    print(f"ERROR: {message}")
+                    set_source_status("error", source, message)
+                else:
+                    finish_active_tracks()
+                    cap.release()
+                    cap = next_cap if next_cap is not None else cv2.VideoCapture()
+                    source = next_source
+                    sighting_track_keys.clear()
+                    if person_detector is not None:
+                        person_detector.reset()
+                    last_person_boxes = []
+                    source_is_live = is_live_capture_source(source)
+                    read_failure_count = 0
+                    browser_frame_version = 0
+                    frame_count = 0
+                    browser_last_frame_at = (
+                        time.monotonic()
+                        if source == "browser"
+                        else 0.0
+                    )
+                    if source != "browser":
+                        clear_browser_frame()
+
+                    for future in recognition_jobs.values():
+                        future.cancel()
+                    recognition_jobs.clear()
+                    last_boxes.clear()
+                    last_face_crops.clear()
+                    track_seen_count.clear()
+                    missing_frames.clear()
+                    recognition_attempts.clear()
+                    failed_tracks.clear()
+                    active_tracks.clear()
+                    expired_tracks.clear()
+                    entry_logged_tracks.clear()
+                    visitor_manager.track_to_visitor.clear()
+                    visitor_manager.pending_tracks.clear()
+
+                    for tracker in getattr(
+                        getattr(yolo, "predictor", None),
+                        "trackers",
+                        (),
+                    ):
+                        reset_tracker = getattr(tracker, "reset", None)
+                        if reset_tracker is not None:
+                            reset_tracker()
+
+                    set_source_status(
+                        "running",
+                        source,
+                        (
+                            "Waiting for browser camera frames."
+                            if source == "browser"
+                            else "Video source opened successfully."
+                        ),
+                    )
+                    print(f"Switched video source to {describe_source(source)}.")
+
+        if source == "browser":
+            if get_source_status()["state"] == "paused":
+                time.sleep(0.02)
+                continue
+            frame, new_version = take_browser_frame(browser_frame_version)
+            if frame is None:
+                if (
+                    browser_last_frame_at
+                    and time.monotonic() - browser_last_frame_at > 1.0
+                    and get_source_status()["state"] == "running"
+                ):
+                    clear_frame()
+                    set_source_status(
+                        "waiting",
+                        source,
+                        "Waiting for browser camera frames.",
+                    )
+                time.sleep(0.01)
+                continue
+            browser_frame_version = new_version
+            browser_last_frame_at = time.monotonic()
+            if get_source_status()["state"] != "running":
+                set_source_status(
+                    "running",
+                    source,
+                    "Receiving browser camera frames.",
+                )
+            ret = True
+        else:
+            frame = None
+            ret = False
+
+        if source != "browser" and not cap.isOpened():
+            if is_live_capture_source(source):
+                set_source_status(
+                    "reconnecting",
+                    source,
+                    "Live source is unavailable; retrying connection.",
+                )
+                time.sleep(1.0)
+                try:
+                    cap = open_capture(source)
+                except cv2.error:
+                    message = f"Could not reconnect to {describe_source(source)}."
+                    print(f"ERROR: {message}")
+                    set_source_status("error", source, message)
+                    cap = cv2.VideoCapture()
+                else:
+                    if cap.isOpened():
+                        read_failure_count = 0
+                        set_source_status(
+                            "running",
+                            source,
+                            "Live source reconnected.",
+                        )
+                    else:
+                        message = "Live source is still unavailable; retrying."
+                        set_source_status("reconnecting", source, message)
+            else:
+                time.sleep(0.1)
+            continue
 
         # ====================================================
         # READ FRAME
         # ====================================================
 
-        ret, frame = (
-            cap.read()
-        )
+        if source != "browser":
+            ret, frame = cap.read()
 
 
         if not ret:
-
-            print(
-                "WARNING: "
-                "Frame read failed."
-            )
-
+            read_failure_count += 1
+            if not source_is_live:
+                cap.release()
+                finish_active_tracks()
+                clear_frame()
+                message = "Video playback reached its end or the file could not be decoded."
+                print(message)
+                set_source_status("completed", source, message)
+            elif read_failure_count >= 3:
+                cap.release()
+                clear_frame()
+                set_source_status(
+                    "reconnecting",
+                    source,
+                    "Live stream stopped delivering frames; retrying connection.",
+                )
+            else:
+                time.sleep(0.1)
             continue
+
+        read_failure_count = 0
 
 
         frame_count += 1
@@ -692,95 +1088,22 @@ try:
             frame_count
             %
             (
-                SKIP_FRAMES + 1
+                (0 if source == "browser" else SKIP_FRAMES) + 1
             )
             == 0
         ):
 
-
-            # =================================================
-            # YUNET
-            # =================================================
-
-            yunet.setInputSize(
-                (
-                    frame.shape[1],
-                    frame.shape[0]
-                )
+            last_person_boxes = (
+                person_detector.detect(frame)
+                if person_detector is not None
+                else []
             )
 
-
-            _, yunet_faces = (
-                yunet.detect(
-                    frame
-                )
+            valid_yunet_boxes = (
+                detect_yunet_boxes(frame, yunet)
+                if yunet is not None
+                else []
             )
-
-
-            valid_yunet_boxes = []
-
-
-            if (
-                yunet_faces
-                is not None
-            ):
-
-                for face in (
-                    yunet_faces
-                ):
-
-                    fx = int(
-                        face[0]
-                    )
-
-                    fy = int(
-                        face[1]
-                    )
-
-                    fw = int(
-                        face[2]
-                    )
-
-                    fh = int(
-                        face[3]
-                    )
-
-
-                    fx1 = max(
-                        0,
-                        fx
-                    )
-
-                    fy1 = max(
-                        0,
-                        fy
-                    )
-
-                    fx2 = min(
-                        frame.shape[1],
-                        fx + fw
-                    )
-
-                    fy2 = min(
-                        frame.shape[0],
-                        fy + fh
-                    )
-
-
-                    if (
-                        fx2 > fx1
-                        and
-                        fy2 > fy1
-                    ):
-
-                        valid_yunet_boxes.append(
-                            (
-                                fx1,
-                                fy1,
-                                fx2,
-                                fy2
-                            )
-                        )
 
 
             # =================================================
@@ -803,7 +1126,7 @@ try:
 
                 iou=0.50,
 
-                imgsz=640,
+                imgsz=YOLO_IMAGE_SIZE,
 
                 verbose=False
             )
@@ -938,20 +1261,7 @@ try:
                     # FACE SIZE FILTER
                     # =========================================
 
-                    if (
-                        width
-                        <
-                        MIN_FACE_WIDTH
-                    ):
-
-                        continue
-
-
-                    if (
-                        height
-                        <
-                        MIN_FACE_HEIGHT
-                    ):
+                    if min(width, height) < MIN_FACE_SIZE:
 
                         continue
 
@@ -968,9 +1278,7 @@ try:
                     # YUNET VALIDATION
                     # =========================================
 
-                    face_confirmed = (
-                        False
-                    )
+                    face_confirmed = not VALIDATE_WITH_YUNET
 
 
                     for yunet_box in (
@@ -1236,13 +1544,6 @@ try:
                 )
 
 
-                recognition_failed = (
-                    track_id
-                    in
-                    failed_tracks
-                )
-
-
                 # =============================================
                 # START RECOGNITION
                 # =============================================
@@ -1255,9 +1556,6 @@ try:
                     not recognition_running
 
                     and
-                    not recognition_failed
-
-                    and
 
                     track_seen_count[
                         track_id
@@ -1267,17 +1565,31 @@ try:
 
                     and
 
-                    recognition_attempts[
+                    time.monotonic()
+                    >=
+                    recognition_retry_after[
                         track_id
                     ]
-                    <
-                    MAX_RECOGNITION_ATTEMPTS
 
                 ):
 
 
-                    recognition_frame = (
-                        frame.copy()
+                    x1, y1, x2, y2 = candidate["bbox"]
+                    padding_x = int((x2 - x1) * 0.35)
+                    padding_y = int((y2 - y1) * 0.35)
+                    crop_x1 = max(0, x1 - padding_x)
+                    crop_y1 = max(0, y1 - padding_y)
+                    crop_x2 = min(frame.shape[1], x2 + padding_x)
+                    crop_y2 = min(frame.shape[0], y2 + padding_y)
+                    recognition_crop = frame[
+                        crop_y1:crop_y2,
+                        crop_x1:crop_x2,
+                    ].copy()
+                    recognition_bbox = (
+                        x1 - crop_x1,
+                        y1 - crop_y1,
+                        x2 - crop_x1,
+                        y2 - crop_y1,
                     )
 
 
@@ -1289,11 +1601,9 @@ try:
 
                             recognizer.get_embedding,
 
-                            recognition_frame,
+                            recognition_crop,
 
-                            candidate[
-                                "bbox"
-                            ]
+                            recognition_bbox
 
                         )
 
@@ -1355,7 +1665,7 @@ try:
                         track_id,
                         0
                     )
-                    > 1
+                    >= MAX_MISSING_FRAMES
                 ):
 
                     continue
@@ -1401,25 +1711,14 @@ try:
                     )
 
 
-                    if (
-
-                        recognition_attempts[
-                            track_id
-                        ]
-                        >=
-                        MAX_RECOGNITION_ATTEMPTS
-
-                    ):
-
-                        failed_tracks.add(
-                            track_id
+                    failed_tracks.add(track_id)
+                    recognition_retry_after[track_id] = (
+                        time.monotonic()
+                        + min(
+                            2.0,
+                            0.25 * recognition_attempts[track_id],
                         )
-
-
-                        last_boxes.pop(
-                            track_id,
-                            None
-                        )
+                    )
 
 
                     continue
@@ -1435,6 +1734,8 @@ try:
                     f"track_id={track_id}"
 
                 )
+                failed_tracks.discard(track_id)
+                recognition_retry_after[track_id] = time.monotonic() + 0.25
 
 
                 # =============================================
@@ -1764,6 +2065,10 @@ try:
                 failed_tracks.discard(
                     old_track
                 )
+                sighting_track_keys.pop(
+                    ("face", old_track),
+                    None,
+                )
 
 
             # =================================================
@@ -1813,19 +2118,6 @@ try:
         ) in list(
             last_boxes.items()
         ):
-
-
-            # ================================================
-            # FAILED
-            # ================================================
-
-            if (
-                track_id
-                in
-                failed_tracks
-            ):
-
-                continue
 
 
             # ================================================
@@ -1879,6 +2171,7 @@ try:
                 label = (
                     f"Person {visitor_id}"
                 )
+                box_color = (0, 255, 0)
 
 
             # ================================================
@@ -1894,15 +2187,29 @@ try:
                 label = (
                     "Recognizing..."
                 )
+                box_color = (0, 200, 255)
 
 
-            # ================================================
-            # NOTHING
-            # ================================================
+            elif track_id in visitor_manager.pending_tracks:
+                label = "Confirming new face..."
+                box_color = (0, 200, 255)
 
             else:
+                if track_id in failed_tracks:
+                    label = "Unrecognized face"
+                    box_color = (0, 0, 255)
+                else:
+                    label = "Face"
+                    box_color = (0, 200, 255)
 
-                continue
+            if track_id not in visitor_manager.track_to_visitor:
+                face_crop = last_face_crops.get(track_id)
+                record_unrecognized_sighting(
+                    "face",
+                    track_id,
+                    "Face detected - not recognized",
+                    face_crop,
+                )
 
 
             x1, y1, x2, y2 = (
@@ -1928,11 +2235,7 @@ try:
                     y2
                 ),
 
-                (
-                    0,
-                    255,
-                    0
-                ),
+                box_color,
 
                 2
 
@@ -1961,14 +2264,66 @@ try:
 
                 0.7,
 
-                (
-                    0,
-                    255,
-                    0
-                ),
+                box_color,
 
                 2
 
+            )
+
+        active_person_track_ids = {
+            person_track_id
+            for person_track_id, _ in last_person_boxes
+        }
+        for key in list(sighting_track_keys):
+            if key[0] == "person" and key[1] not in active_person_track_ids:
+                sighting_track_keys.pop(key, None)
+
+        for person_track_id, (
+            person_x,
+            person_y,
+            person_width,
+            person_height,
+        ) in last_person_boxes:
+            person_x1 = max(0, person_x)
+            person_y1 = max(0, person_y)
+            person_x2 = min(frame.shape[1], person_x + person_width)
+            person_y2 = min(frame.shape[0], person_y + person_height)
+            if person_x2 <= person_x1 or person_y2 <= person_y1:
+                continue
+
+            face_visible = any(
+                person_x1 <= (x1 + x2) / 2 <= person_x2
+                and person_y1 <= (y1 + y2) / 2
+                <= person_y1 + (person_y2 - person_y1) * 0.45
+                for face_track_id, (x1, y1, x2, y2) in last_boxes.items()
+                if missing_frames.get(face_track_id, 0)
+                <= MAX_DISPLAY_MISSING_CYCLES
+            )
+            if face_visible:
+                continue
+
+            person_color = (255, 180, 0)
+            record_unrecognized_sighting(
+                "person",
+                person_track_id,
+                "Person detected - no face visible",
+                frame[person_y1:person_y2, person_x1:person_x2],
+            )
+            cv2.rectangle(
+                frame,
+                (person_x1, person_y1),
+                (person_x2, person_y2),
+                person_color,
+                2,
+            )
+            cv2.putText(
+                frame,
+                "Person detected - no face visible",
+                (person_x1, max(person_y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                person_color,
+                2,
             )
 
 

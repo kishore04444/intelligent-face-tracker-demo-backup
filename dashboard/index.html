@@ -47,10 +47,12 @@
         <p>Real-time face detection, recognition and visitor tracking.</p>
       </div>
       <div class="top-status">
+        <button id="resetDatabaseButton" class="reset-button" type="button">Reset database</button>
         <span class="session"><i class="status-dot"></i> LIVE SESSION</span>
         <span id="clock">--:--:--</span>
       </div>
     </header>
+    <div id="resetMessage" class="reset-message" role="status" aria-live="polite"></div>
 
     <section id="overview" class="view active-view">
       <div class="stats">
@@ -84,11 +86,40 @@
           </div>
           <div class="camera-wrap">
             <img id="liveFeed" src="/api/stream" alt="Live annotated camera stream">
+            <video id="browserCameraPreview" class="browser-camera-preview" autoplay playsinline muted hidden></video>
             <div id="feedMessage" class="feed-message">Connecting to camera…</div>
             <span class="camera-label top-left">LIVE · ANNOTATED</span>
             <span class="camera-label bottom-left">YOLOv8 · BYTETRACK · ARCFACE</span>
             <span class="camera-label bottom-right">LOCAL CPU</span>
           </div>
+          <div class="source-controls">
+            <form id="uploadForm" class="source-form">
+              <label for="videoFile">Upload a video</label>
+              <div class="source-form-row">
+                <input id="videoFile" name="video" type="file" accept="video/*,.avi,.mkv,.mov,.mp4,.mpeg,.mpg,.webm" required>
+                <button type="submit">Upload &amp; process</button>
+              </div>
+              <small>MP4, AVI, MOV, MKV, MPEG or WEBM · up to 512 MB</small>
+            </form>
+            <form id="sourceForm" class="source-form">
+              <label for="sourceInput">Connect a server-side camera or stream</label>
+              <div class="source-form-row">
+                <input id="sourceInput" name="source" type="text" placeholder="Camera index (0) or RTSP / HTTP stream URL" autocomplete="off" required>
+                <button type="submit">Connect</button>
+              </div>
+              <small>Camera index / RTSP source is opened on the computer running the tracker.</small>
+            </form>
+            <div class="source-form browser-camera-form">
+              <label>Use the camera on this device</label>
+              <div class="source-form-row">
+                <button id="browserCameraButton" type="button">Start device camera</button>
+                <button id="stopBrowserCameraButton" class="secondary-button" type="button" hidden>Stop camera</button>
+              </div>
+              <small>Allow browser camera access. Mobile access from another device requires HTTPS.</small>
+            </div>
+            <div id="sourceMessage" class="source-message" role="status" aria-live="polite">Checking input source…</div>
+          </div>
+          <canvas id="browserCameraCanvas" hidden></canvas>
           <div class="camera-footer">
             <span><i class="status-dot"></i> Detection active</span>
             <span id="trackSummary">0 active tracks</span>
@@ -132,6 +163,15 @@
           </div>
         </section>
       </div>
+
+      <section class="card unrecognized-card">
+        <div class="card-head">
+          <div><span class="overline">SAVED SIGHTINGS</span><h2>People without a recognized face</h2></div>
+          <span id="unrecognizedCount" class="state-badge neutral-badge">0 recorded</span>
+        </div>
+        <p class="unrecognized-description">Every confirmed sighting is saved here permanently until you use Reset database. These records are separate from visitor identities and never create entry/exit events.</p>
+        <div id="unrecognizedPeopleList" class="unrecognized-list"><div class="empty">No unrecognized sightings have been recorded yet.</div></div>
+      </section>
     </section>
 
     <section id="visitors" class="view">
@@ -176,7 +216,10 @@
 <div class="modal-backdrop" id="visitorModal">
   <div class="modal">
     <button class="modal-close" id="modalClose">×</button>
-    <div class="modal-id" id="modalAvatar">01</div>
+    <div class="visitor-modal-photo-wrap">
+      <img class="visitor-modal-photo" id="modalVisitorPhoto" alt="" hidden>
+      <div class="modal-id" id="modalAvatar">01</div>
+    </div>
     <span class="overline">VISITOR PROFILE</span>
     <h2 id="modalTitle">Visitor 1</h2>
     <div class="detail-grid"></div>

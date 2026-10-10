@@ -1,11 +1,13 @@
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 DB_PATH = "database/visitors.db"
 
 
 class Database:
     def __init__(self):
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(DB_PATH)
         self.create_tables()
         self.migrate_embeddings()
@@ -42,6 +44,28 @@ class Database:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (visitor_id) REFERENCES visitors(id)
             )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS unrecognized_sightings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tracker_key TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                image_path TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_timestamp_id
+            ON events(timestamp, id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_visitor_id
+            ON events(visitor_id, id)
         """)
 
         self.conn.commit()
@@ -212,6 +236,74 @@ class Database:
         ))
 
         self.conn.commit()
+
+    def get_event_image_paths(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT image_path FROM events WHERE image_path IS NOT NULL"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def add_unrecognized_sighting(
+        self,
+        tracker_key,
+        kind,
+        label,
+        image_path=None,
+    ):
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO unrecognized_sightings
+                (tracker_key, kind, label, first_seen, last_seen, image_path)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tracker_key) DO NOTHING
+            """,
+            (tracker_key, kind, label, now, now, image_path),
+        )
+        self.conn.commit()
+
+    def get_unrecognized_sightings(self):
+        return self.conn.execute(
+            """
+            SELECT id, kind, label, first_seen, last_seen, image_path
+            FROM unrecognized_sightings
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+    def get_unrecognized_image_paths(self):
+        rows = self.conn.execute(
+            """
+            SELECT image_path FROM unrecognized_sightings
+            WHERE image_path IS NOT NULL
+            """
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def reset(self):
+        image_paths = self.get_event_image_paths()
+        image_paths.extend(self.get_unrecognized_image_paths())
+        cursor = self.conn.cursor()
+
+        with self.conn:
+            cursor.execute("DELETE FROM events")
+            cursor.execute("DELETE FROM visitor_embeddings")
+            cursor.execute("DELETE FROM visitors")
+            cursor.execute("DELETE FROM unrecognized_sightings")
+            cursor.execute(
+                """
+                DELETE FROM sqlite_sequence
+                WHERE name IN (
+                    'events',
+                    'visitor_embeddings',
+                    'visitors',
+                    'unrecognized_sightings'
+                )
+                """
+            )
+
+        return image_paths
 
     def close(self):
         self.conn.close()

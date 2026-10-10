@@ -1,20 +1,30 @@
 {
     "input": {
-        "source": "0",
-        "type": "camera"
+        "source": "browser",
+        "type": "browser"
     },
     "detection": {
-        "confidence": 0.5,
-        "skip_frames": 5
+        "confidence": 0.25,
+        "skip_frames": 1,
+        "image_size": 800,
+        "min_face_size": 20,
+        "validate_with_yunet": false
+    },
+    "person_detection": {
+        "enabled": true,
+        "max_dimension": 640,
+        "score_threshold": 1.1,
+        "min_hits": 2,
+        "max_missing": 1
     },
     "recognition": {
-        "similarity_threshold": 0.5
+        "similarity_threshold": 0.62
     },
     "tracking": {
         "max_missing_frames": 30
     },
     "output": {
-        "show_window": true,
+        "show_window": false,
         "save_images": true
     }
 }

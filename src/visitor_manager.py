@@ -6,7 +6,7 @@ from logger import log_event
 
 class VisitorManager:
 
-    def __init__(self, similarity_threshold=0.5):
+    def __init__(self, similarity_threshold=0.62):
 
         self.db = Database()
 
@@ -19,14 +19,50 @@ class VisitorManager:
         # Temporarily stores faces that are not yet confirmed
         self.pending_tracks = {}
 
-        # Require 3 consistent observations before registering
-        self.required_confirmation = 3
+        # Require a second consistent embedding so first-time registration
+        # completes quickly without accepting a single noisy observation.
+        self.required_confirmation = 2
 
         # Stronger threshold for confirming a brand-new visitor
-        self.pending_similarity_threshold = 0.72
+        self.pending_similarity_threshold = 0.60
 
         # Only add a new embedding template for strong matches
         self.template_add_threshold = 0.70
+        self._template_visitor_ids = []
+        self._template_matrix = np.empty((0, 512), dtype=np.float32)
+        self._load_template_cache()
+
+    def _load_template_cache(self):
+        visitor_ids = []
+        embeddings = []
+        for visitor_id, embedding_blob in self.db.get_all_embeddings():
+            embedding = self.normalize(
+                np.frombuffer(embedding_blob, dtype=np.float32)
+            )
+            if embedding is None or embedding.shape != (512,):
+                continue
+            visitor_ids.append(visitor_id)
+            embeddings.append(embedding)
+
+        self._template_visitor_ids = visitor_ids
+        self._template_matrix = (
+            np.stack(embeddings)
+            if embeddings
+            else np.empty((0, 512), dtype=np.float32)
+        )
+
+    def _cache_embedding(self, visitor_id, embedding):
+        normalized = self.normalize(embedding)
+        if normalized is None or normalized.shape != (512,):
+            return
+        self._template_visitor_ids.append(visitor_id)
+        self._template_matrix = np.vstack(
+            (self._template_matrix, normalized)
+        )
+
+    def clear_template_cache(self):
+        self._template_visitor_ids.clear()
+        self._template_matrix = np.empty((0, 512), dtype=np.float32)
 
     def normalize(self, embedding):
 
@@ -54,43 +90,13 @@ class VisitorManager:
         if current_embedding is None:
             return None, -1.0
 
-        stored_embeddings = (
-            self.db.get_all_embeddings()
-        )
+        if not self._template_visitor_ids:
+            return None, -1.0
 
-        best_visitor_id = None
-        best_similarity = -1.0
-
-        for visitor_id, embedding_blob in (
-            stored_embeddings
-        ):
-
-            stored_embedding = np.frombuffer(
-                embedding_blob,
-                dtype=np.float32
-            )
-
-            if stored_embedding.size == 0:
-                continue
-
-            stored_embedding = self.normalize(
-                stored_embedding
-            )
-
-            if stored_embedding is None:
-                continue
-
-            similarity = float(
-                np.dot(
-                    current_embedding,
-                    stored_embedding
-                )
-            )
-
-            if similarity > best_similarity:
-
-                best_similarity = similarity
-                best_visitor_id = visitor_id
+        similarities = self._template_matrix @ current_embedding
+        best_index = int(np.argmax(similarities))
+        best_similarity = float(similarities[best_index])
+        best_visitor_id = self._template_visitor_ids[best_index]
 
         if (
             best_visitor_id is not None
@@ -249,6 +255,7 @@ class VisitorManager:
                     visitor_id,
                     embedding
                 )
+                self._cache_embedding(visitor_id, embedding)
 
                 log_event(
                     f"EMBEDDING_TEMPLATE_ADDED | "
@@ -357,6 +364,7 @@ class VisitorManager:
         visitor_id = self.db.add_visitor(
             embedding
         )
+        self._cache_embedding(visitor_id, embedding)
 
         self.track_to_visitor[
             track_id

@@ -221,32 +221,52 @@ Example configuration:
 
     {
         "input": {
-            "source": "0",
-            "type": "camera"
+            "source": "browser",
+            "type": "browser"
         },
         "detection": {
-            "confidence": 0.5,
-            "skip_frames": 5
+            "confidence": 0.25,
+            "skip_frames": 1,
+            "image_size": 800,
+            "min_face_size": 20,
+            "validate_with_yunet": false
+        },
+        "person_detection": {
+            "enabled": true,
+            "max_dimension": 640,
+            "score_threshold": 1.1,
+            "min_hits": 2,
+            "max_missing": 1
         },
         "recognition": {
-            "similarity_threshold": 0.5
+            "similarity_threshold": 0.62
         },
         "tracking": {
             "max_missing_frames": 30
         },
         "output": {
-            "show_window": true,
+            "show_window": false,
             "save_images": true
         }
     }
 
 ### Input Source
 
-    "source": "0"
+    "source": "browser"
 
-uses the default camera.
+uses the camera opened by the dashboard browser. A numeric source such as
+`"0"` opens the tracker's default attached camera.
 
-A video file or RTSP stream can also be supplied through the input source configuration.
+The default source, `browser`, waits for you to click **Start device camera** in
+the dashboard and grant browser permission. This uses the camera on the device
+that opened the dashboard, including a phone camera when the dashboard is
+opened on that phone. Open the dashboard at `http://127.0.0.1:5000` on the
+tracker computer for local camera access. Browsers block camera access on
+ordinary HTTP network addresses; a phone connecting to another computer needs
+the dashboard served over trusted HTTPS.
+
+Use a numeric source such as `"0"` for a camera attached to the tracker
+computer. An uploaded video or RTSP stream can be selected in the dashboard.
 
 ### Detection
 
@@ -256,13 +276,29 @@ controls the detection confidence threshold.
 
     "skip_frames": 5
 
-controls the configured detection frame interval.
+controls how many input frames are skipped between detection/tracking passes. Higher values can speed up processing at the cost of tracking detail. The shipped profile uses 1 (process every second frame), confidence 0.25, 800-pixel inference, and a 20-pixel minimum face size. On the included sample, the 800-pixel profile averaged about 0.055 seconds per tracked inference and retained three ByteTrack IDs across the first 45 frames; a 960-pixel run at confidence 0.30 averaged about 0.070 seconds. These are CPU measurements on one sample, not a performance guarantee. Detection and recognition quality still depend on lighting, face size, motion, and the available CPU/GPU. YuNet cross-validation is optional and disabled by default because it costs CPU time and can reject true YOLO detections.
+
+The optional CPU HOG pedestrian detector (`person_detection.enabled`) adds boxes
+labelled **Person detected - no face visible** when it finds a body without a face.
+This is detection only: it does not identify a person or connect a back-facing
+body track to that person's face identity. It filters weak HOG scores and
+requires repeated overlapping detections, which reduces one-frame false
+positive boxes. Each unrecognized face or person detected without a visible
+face is recorded permanently in a separate sightings list with its first-seen
+time and, when available, a saved image. These records survive source changes
+and app restarts; **Reset database** clears them. They are not visitor records
+and do not create entry/exit events. Face recognition requires a visible,
+sufficiently large face.
+
+Use `validate_with_yunet: true` to enable the second detector when precision is more important than speed. Raise the confidence/minimum face size to reduce small or uncertain detections; lowering either can increase false detections.
 
 ### Recognition
 
-    "similarity_threshold": 0.5
+    "similarity_threshold": 0.62
 
-controls the minimum similarity required to recognize a stored visitor.
+controls the minimum similarity required to recognize a stored visitor. The default was raised to reduce false matches; identities with poor lighting, side angles, or very small faces may need another clear observation before they match.
+
+Unregistered faces are enrolled only after three same-track observations agree (default pending similarity 0.60), which reduces duplicate visitor records without relying on a single blurry frame.
 
 ### Tracking
 
@@ -291,6 +327,18 @@ Windows PowerShell:
 
     pip install -r requirements.txt
 
+On Windows, `setup_local.bat` creates the Python 3.10 virtual environment and
+installs the pinned dependencies. Initial setup requires internet access to
+download packages. Once setup completes, use `start_local.bat` for future
+launches; it runs the tracker with the project's environment and keeps the
+console open if the application exits with an error.
+
+The first start may also need to download InsightFace's `buffalo_l` model
+weights if they are not already present in the local model cache. After the
+weights are cached, inference runs locally. Keep the `models` directory,
+`config.json`, and local `database`, `logs`, and `videos` data together when
+moving or backing up an installation.
+
 ## 9. Running the System
 
 From the project root:
@@ -301,7 +349,60 @@ The configured input source is loaded from:
 
     config.json
 
-The application opens the configured camera or video source and processes the detected faces.
+Startup validates configuration values and reports the offending setting
+before loading the tracking pipeline. Detection thresholds, frame skipping,
+image dimensions, tracking limits, and output flags must use supported types
+and ranges.
+
+The application opens the configured camera, local video, or network stream and serves the dashboard at:
+
+    http://127.0.0.1:5000
+
+By default, the dashboard binds to loopback only. To make it reachable from
+another device, set `DASHBOARD_HOST=0.0.0.0`; set `DASHBOARD_PORT` to change the
+port. To enable HTTPS directly, provide both `DASHBOARD_TLS_CERT` and
+`DASHBOARD_TLS_KEY` with paths to a browser-trusted certificate and key. For
+example, in PowerShell:
+
+    $env:DASHBOARD_HOST = "0.0.0.0"
+    $env:DASHBOARD_TLS_CERT = "C:\certs\tracker.crt"
+    $env:DASHBOARD_TLS_KEY = "C:\certs\tracker.key"
+    python src\main.py
+
+Open the resulting HTTPS address on the client device and allow camera access.
+For a phone, the certificate must be trusted by the phone; a self-signed
+certificate warning does not satisfy browser camera security requirements.
+The dashboard has no authentication, so expose it only on a trusted network
+and use a firewall or an authenticated HTTPS reverse proxy when remote access
+is needed.
+
+The dashboard can switch sources while the application is running:
+
+- Start the laptop/mobile camera directly in the browser. Frames are sent to the tracker for inference; use `https://` when the dashboard is opened from another device (browser camera permissions are blocked on ordinary LAN HTTP).
+- Upload a supported video (AVI, MKV, MOV, MP4, MPEG, MPG, or WEBM; maximum 512 MB). The video is processed from the server's local `videos\uploads` folder. Processing stops at end-of-file and waits for another source.
+- Connect a camera attached to the tracker computer using its camera index (for example, `0`).
+- Connect an RTSP, RTMP, HTTP, or HTTPS stream using a stream URL. The application retries a dropped live connection.
+- RTSP streams try TCP transport first and fall back to UDP if opening fails. If neither can connect, check network access to the camera's RTSP port, the stream path, and any required credentials.
+- At end-of-file and when switching sources, recognized visitors receive exit events and outstanding face-recognition work is given up to 10 seconds to finish.
+
+First-time visitor registration is confirmed from two consistent face
+embeddings. If an embedding cannot be extracted, the tracker now retries with
+a short backoff instead of permanently abandoning the face after four failed
+attempts.
+
+Source paths in `config.json` are resolved relative to the project root, so the program can also be launched from another working directory. The visitor directory shows the latest saved entry/exit face image for each visitor when one exists; if image saving is disabled or no event image is available, it shows the visitor ID placeholder instead.
+
+For a headless run, set `output.show_window` to `false` in `config.json`; the dashboard feed remains available.
+
+The tracker uses CUDA for InsightFace when `onnxruntime` reports a CUDA provider and otherwise selects CPU. The checked workspace currently reports CPU/Azure providers only and PyTorch is CPU-only, so inference runs on CPU and cannot match a CUDA-equipped live system's throughput. GPU deployments need CUDA-compatible PyTorch and `onnxruntime-gpu` builds in place of CPU-only packages. `output.show_window` defaults to false to avoid rendering an extra desktop preview; use the dashboard for video, or set it true to enable the OpenCV window.
+
+Use the dashboard's **Reset database** action to clear visitor identities and embeddings, entry/exit counts and history, and saved face evidence. The browser asks for confirmation first; the live pipeline then clears its in-memory identities so visitors are recognized afresh.
+
+To smoke-test YuNet independently from the full tracker:
+
+    python src\camera_test.py 0
+    python src\camera_test.py videos\sample.mp4
+    python src\camera_test.py rtsp://camera-host/live --headless
 
 ## 10. Database
 
@@ -336,6 +437,9 @@ Events store:
 Runtime events are written to:
 
     logs/events.log
+
+The event log rotates at 5 MB and retains up to five previous log files so a
+long-running local installation does not grow the log indefinitely.
 
 Example:
 
@@ -461,9 +565,7 @@ The system has been tested with:
 
 Possible extensions include:
 
-- RTSP camera deployment
-- Web-based monitoring dashboard
-- Real-time visitor statistics
+- Authenticated remote dashboard access
 - Multiple camera support
 - GPU acceleration
 - Advanced track management

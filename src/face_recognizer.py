@@ -1,4 +1,7 @@
+import os
+
 import numpy as np
+import onnxruntime as ort
 
 from insightface.app import FaceAnalysis
 
@@ -7,16 +10,34 @@ class FaceRecognizer:
 
     def __init__(self):
 
+        available_providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" in available_providers:
+            providers = [
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+            context_id = 0
+        else:
+            providers = ["CPUExecutionProvider"]
+            context_id = -1
+
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = min(
+            4,
+            max(1, os.cpu_count() or 1),
+        )
+        session_options.inter_op_num_threads = 1
+
         self.app = FaceAnalysis(
             name="buffalo_l",
-            providers=[
-                "CPUExecutionProvider"
-            ]
+            allowed_modules=["detection", "recognition"],
+            providers=providers,
+            sess_options=session_options,
         )
 
         self.app.prepare(
-            ctx_id=0,
-            det_size=(320, 320)
+            ctx_id=context_id,
+            det_size=(160, 160),
         )
 
 
